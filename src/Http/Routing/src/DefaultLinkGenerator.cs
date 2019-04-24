@@ -31,10 +31,17 @@ namespace Microsoft.AspNetCore.Routing
         private readonly LinkOptions _globalLinkOptions;
 
         // Caches TemplateBinder instances
-        private readonly DataSourceDependentCache<ConcurrentDictionary<RouteEndpoint, TemplateBinder>> _cache;
+        private readonly DataSourceDependentCache<ConcurrentDictionary<RouteEndpoint, TemplateBinder>> _binderCache;
+
+        // Caches RoutePatternMatcher instances
+        private readonly DataSourceDependentCache<ConcurrentDictionary<RouteEndpoint, RoutePatternMatcher>> _matcherCache;
 
         // Used to initialize TemplateBinder instances
         private readonly Func<RouteEndpoint, TemplateBinder> _createTemplateBinder;
+
+
+        // Used to initialize TemplateMatcher instances
+        private readonly Func<RouteEndpoint, RoutePatternMatcher> _createRoutePatternMatcher;
 
         public DefaultLinkGenerator(
             ParameterPolicyFactory parameterPolicyFactory,
@@ -51,15 +58,25 @@ namespace Microsoft.AspNetCore.Routing
 
             // We cache TemplateBinder instances per-Endpoint for performance, but we want to wipe out
             // that cache is the endpoints change so that we don't allow unbounded memory growth.
-            _cache = new DataSourceDependentCache<ConcurrentDictionary<RouteEndpoint, TemplateBinder>>(dataSource, (_) =>
+            _binderCache = new DataSourceDependentCache<ConcurrentDictionary<RouteEndpoint, TemplateBinder>>(dataSource, (_) =>
             {
                 // We don't eagerly fill this cache because there's no real reason to. Unlike URL matching, we don't
                 // need to build a big data structure up front to be correct.
                 return new ConcurrentDictionary<RouteEndpoint, TemplateBinder>();
             });
 
+            // We cache RoutePatternMatcher instances per-Endpoint for performance, but we want to wipe out
+            // that cache is the endpoints change so that we don't allow unbounded memory growth.
+            _matcherCache = new DataSourceDependentCache<ConcurrentDictionary<RouteEndpoint, RoutePatternMatcher>>(dataSource, (_) =>
+            {
+                // We don't eagerly fill this cache because there's no real reason to. Unlike URL matching, we don't
+                // need to build a big data structure up front to be correct.
+                return new ConcurrentDictionary<RouteEndpoint, RoutePatternMatcher>();
+            });
+
             // Cached to avoid per-call allocation of a delegate on lookup.
             _createTemplateBinder = CreateTemplateBinder;
+            _createRoutePatternMatcher = CreateRoutePatternMatcher;
 
             _globalLinkOptions = new LinkOptions()
             {
@@ -280,13 +297,43 @@ namespace Microsoft.AspNetCore.Routing
             return null;
         }
 
+        public override RouteValueDictionary ParsePathByAddress<TAddress>(TAddress address, PathString path)
+        {
+            var endpoints = GetEndpoints(address);
+            if (endpoints.Count == 0)
+            {
+                return null;
+            }
+
+            for (var i = 0; i < endpoints.Count; i++)
+            {
+                var endpoint = endpoints[i];
+                if (TryParse(endpoint, path, out var values))
+                {
+                    return values;
+                }
+            }
+
+            Log.LinkGenerationFailed(_logger, endpoints);
+            return null;
+        }
+
         private TemplateBinder CreateTemplateBinder(RouteEndpoint endpoint)
         {
             return _binderFactory.Create(endpoint.RoutePattern);
         }
 
+        private RoutePatternMatcher CreateRoutePatternMatcher(RouteEndpoint endpoint)
+        {
+            return new RoutePatternMatcher(endpoint.RoutePattern, new RouteValueDictionary(endpoint.RoutePattern.Defaults));
+        }
+
         // Internal for testing
-        internal TemplateBinder GetTemplateBinder(RouteEndpoint endpoint) => _cache.EnsureInitialized().GetOrAdd(endpoint, _createTemplateBinder);
+        internal TemplateBinder GetTemplateBinder(RouteEndpoint endpoint) => _binderCache.EnsureInitialized().GetOrAdd(endpoint, _createTemplateBinder);
+
+        // Internal for testing
+        internal RoutePatternMatcher GetRoutePatternMatcher(RouteEndpoint endpoint) => _matcherCache.EnsureInitialized().GetOrAdd(endpoint, _createRoutePatternMatcher);
+
 
         // Internal for testing
         internal bool TryProcessTemplate(
@@ -325,6 +372,14 @@ namespace Microsoft.AspNetCore.Routing
             return true;
         }
 
+        internal bool TryParse(RouteEndpoint endpoint, PathString path, out RouteValueDictionary values)
+        {
+            var matcher = GetRoutePatternMatcher(endpoint);
+
+            values = new RouteValueDictionary();
+            return matcher.TryMatch(path, values);
+        }
+
         // Also called from DefaultLinkGenerationTemplate
         public static RouteValueDictionary GetAmbientValues(HttpContext httpContext)
         {
@@ -333,7 +388,7 @@ namespace Microsoft.AspNetCore.Routing
 
         public void Dispose()
         {
-            _cache.Dispose();
+            _binderCache.Dispose();
         }
 
         private static class Log
@@ -350,6 +405,9 @@ namespace Microsoft.AspNetCore.Routing
 
                 public static readonly EventId LinkGenerationSucceeded = new EventId(105, "LinkGenerationSucceeded");
                 public static readonly EventId LinkGenerationFailed = new EventId(106, "LinkGenerationFailed");
+
+                public static readonly EventId PathParsingSucceeded = new EventId(107, "PathParsingSucceeded");
+                public static readonly EventId PathParsingFailed = new EventId(108, "PathParsingFailed");
             }
 
             private static readonly Action<ILogger, IEnumerable<string>, object, Exception> _endpointsFound = LoggerMessage.Define<IEnumerable<string>, object>(
@@ -396,6 +454,16 @@ namespace Microsoft.AspNetCore.Routing
                 LogLevel.Debug,
                 EventIds.LinkGenerationFailed,
                 "Link generation failed for endpoints {Endpoints}");
+
+            private static readonly Action<ILogger, IEnumerable<string>, string, Exception> _pathParsingSucceeded = LoggerMessage.Define<IEnumerable<string>, string>(
+                LogLevel.Debug,
+                EventIds.PathParsingSucceeded,
+                "Path parsing succeeded for endpoints {Endpoints} and URI path {URI}");
+
+            private static readonly Action<ILogger, IEnumerable<string>, string, Exception> _pathParsingFailed = LoggerMessage.Define<IEnumerable<string>, string>(
+                LogLevel.Debug,
+                EventIds.PathParsingFailed,
+                "Path parsing failed for endpoints {Endpoints} and URI path {URI}");
 
             public static void EndpointsFound(ILogger logger, object address, IEnumerable<Endpoint> endpoints)
             {
@@ -458,6 +526,24 @@ namespace Microsoft.AspNetCore.Routing
                 if (logger.IsEnabled(LogLevel.Debug))
                 {
                     _linkGenerationFailed(logger, endpoints.Select(e => e.DisplayName), null);
+                }
+            }
+
+            public static void PathParsingSucceeded(ILogger logger, PathString path, IEnumerable<Endpoint> endpoints)
+            {
+                // Checking level again to avoid allocation on the common path
+                if (logger.IsEnabled(LogLevel.Debug))
+                {
+                    _pathParsingSucceeded(logger, endpoints.Select(e => e.DisplayName), path.Value, null);
+                }
+            }
+
+            public static void PathParsingFailed(ILogger logger, PathString path, IEnumerable<Endpoint> endpoints)
+            {
+                // Checking level again to avoid allocation on the common path
+                if (logger.IsEnabled(LogLevel.Debug))
+                {
+                    _pathParsingFailed(logger, endpoints.Select(e => e.DisplayName), path.Value, null);
                 }
             }
 
